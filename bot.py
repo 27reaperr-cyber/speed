@@ -3,7 +3,66 @@ Speed Up & Slowed Bot — точка входа
 """
 import asyncio
 import logging
+import shutil
+import subprocess
 import sys
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Авто-установка ffmpeg (нужно для BotHost.ru и других хостингов,
+#  где нет возможности установить пакеты после деплоя вручную)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ensure_ffmpeg() -> None:
+    """
+    Проверяет наличие ffmpeg в системе.
+    Если не найден — устанавливает через apt-get (Debian/Ubuntu).
+    Завершает процесс с ошибкой, если установка не удалась.
+    """
+    if shutil.which("ffmpeg"):
+        print("[ffmpeg] ✅ ffmpeg уже установлен, пропускаем.")
+        return
+
+    print("[ffmpeg] ⚙️  ffmpeg не найден — устанавливаю автоматически...")
+    try:
+        # Обновляем список пакетов
+        subprocess.run(
+            ["apt-get", "update", "-y"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        # Устанавливаем ffmpeg
+        subprocess.run(
+            ["apt-get", "install", "-y", "--no-install-recommends", "ffmpeg"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        print("[ffmpeg] ❌ apt-get не найден — установите ffmpeg вручную.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        err = exc.stderr.decode(errors="replace")
+        print(f"[ffmpeg] ❌ Ошибка при установке:\n{err}")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("[ffmpeg] ❌ Превышен таймаут установки ffmpeg.")
+        sys.exit(1)
+
+    # Финальная проверка
+    if shutil.which("ffmpeg"):
+        print("[ffmpeg] ✅ ffmpeg успешно установлен!")
+    else:
+        print("[ffmpeg] ❌ ffmpeg не найден даже после установки. Проверь права.")
+        sys.exit(1)
+
+
+# Вызываем ДО любых импортов, которые зависят от ffmpeg
+_ensure_ffmpeg()
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties

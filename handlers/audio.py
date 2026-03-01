@@ -1,10 +1,12 @@
 """
 Главный обработчик аудио:
   - приём файлов
-  - показ меню эффектов
-  - обработка и отправка результата
+  - inline-меню прямо на аудио-сообщении (как в slowreverbbot)
+  - обработка и отправка результата с новыми кнопками
+  - случайная реакция на сообщение пользователя
 """
 import logging
+import random
 import uuid
 from pathlib import Path
 
@@ -17,26 +19,27 @@ from aiogram.types import (
     CallbackQuery,
     Document,
     Message,
+    ReactionTypeEmoji,
     Voice,
 )
 
 from config.settings import settings
 from services import EFFECTS, SUPPORTED_FORMATS, audio_processor
-from utils.keyboards import back_keyboard, main_menu_keyboard
+from utils.keyboards import effects_keyboard, processing_keyboard
 from utils.states import AudioState
 
 logger = logging.getLogger(__name__)
 router = Router(name="audio")
+
+# Пул реакций для случайного выбора
+REACTION_POOL = ["❤️", "🔥", "🎉", "👏", "😍", "⚡", "🎵", "💯", "🤩", "😎"]
+
 
 # ──────────────────────────────────────────────
 #  Вспомогательные функции
 # ──────────────────────────────────────────────
 
 def _get_file_info(message: Message) -> tuple[str, int, str] | None:
-    """
-    Возвращает (file_id, file_size, original_filename) или None.
-    Поддерживает audio, voice, document.
-    """
     if message.audio:
         obj: Audio = message.audio
         name = obj.file_name or f"audio_{uuid.uuid4().hex[:8]}.mp3"
@@ -61,8 +64,21 @@ async def _download_file(bot: Bot, file_id: str, dest: Path) -> None:
     await bot.download_file(tg_file.file_path, destination=str(dest))
 
 
+async def _set_random_reaction(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Ставит случайную реакцию на сообщение пользователя."""
+    emoji = random.choice(REACTION_POOL)
+    try:
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji)],
+        )
+    except Exception as exc:
+        logger.debug("Не удалось поставить реакцию: %s", exc)
+
+
 # ──────────────────────────────────────────────
-#  Приём аудио
+#  Приём аудио → отправка с inline-меню
 # ──────────────────────────────────────────────
 
 @router.message(
@@ -74,9 +90,8 @@ async def handle_audio(message: Message, state: FSMContext, bot: Bot) -> None:
 
     if info is None:
         await message.answer(
-            "❌ <b>Неподдерживаемый формат.</b>\n\n"
-            f"Принимаю: {', '.join(sorted(SUPPORTED_FORMATS))}",
-            reply_markup=None,
+            f"❌ Неподдерживаемый формат.\n"
+            f"Принимаю: {', '.join(sorted(SUPPORTED_FORMATS))}"
         )
         return
 
@@ -85,47 +100,52 @@ async def handle_audio(message: Message, state: FSMContext, bot: Bot) -> None:
     if file_size > settings.MAX_FILE_SIZE_BYTES:
         size_mb = file_size / 1024 / 1024
         await message.answer(
-            f"❌ <b>Файл слишком большой</b> ({size_mb:.1f} МБ).\n"
+            f"❌ Файл слишком большой ({size_mb:.1f} МБ).\n"
             f"Максимум — {settings.MAX_FILE_SIZE_MB} МБ."
         )
         return
 
-    # Сохраняем данные в FSM
+    # Сохраняем в FSM
     await state.update_data(
         file_id=file_id,
         filename=filename,
+        original_msg_id=message.message_id,
     )
     await state.set_state(AudioState.waiting_for_effect)
 
-    await message.answer(
-        f"✅ Файл <b>{filename}</b> получен!\n\n"
-        "Выбери эффект 👇",
-        reply_markup=main_menu_keyboard(),
+    # Ставим случайную реакцию на исходное сообщение пользователя
+    await _set_random_reaction(bot, message.chat.id, message.message_id)
+
+    # Пересылаем аудио обратно с inline-кнопками прямо на нём
+    sent = await message.copy_to(
+        chat_id=message.chat.id,
+        reply_markup=effects_keyboard(),
     )
+
+    # Сохраняем message_id нашего аудио-сообщения с кнопками
+    await state.update_data(bot_audio_msg_id=sent.message_id)
+
     logger.info(
-        "📥 Файл получен: user=%d | name=%s | size=%d bytes",
+        "📥 Файл получен: user=%d | name=%s | size=%d B",
         message.from_user.id, filename, file_size,
     )
 
 
 # ──────────────────────────────────────────────
-#  Неверный формат (документ с недопустимым расширением)
+#  Неверный документ
 # ──────────────────────────────────────────────
 
-@router.message(
-    AudioState.waiting_for_file,
-    F.document,
-)
+@router.message(AudioState.waiting_for_file, F.document)
 async def handle_wrong_document(message: Message) -> None:
     ext = Path(message.document.file_name or "").suffix.lower()
     await message.answer(
-        f"❌ Формат <code>{ext or 'неизвестен'}</code> не поддерживается.\n\n"
+        f"❌ Формат {ext or 'неизвестен'} не поддерживается.\n"
         f"Поддерживаю: {', '.join(sorted(SUPPORTED_FORMATS))}"
     )
 
 
 # ──────────────────────────────────────────────
-#  Обработка выбора эффекта
+#  Выбор эффекта — обработка
 # ──────────────────────────────────────────────
 
 @router.callback_query(AudioState.waiting_for_effect, F.data.startswith("effect:"))
@@ -134,93 +154,112 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
     effect = EFFECTS.get(effect_key)
 
     if not effect:
-        await callback.answer("⚠️ Неизвестный эффект", show_alert=True)
+        await callback.answer("Неизвестный эффект", show_alert=True)
         return
 
     data = await state.get_data()
-    file_id: str = data.get("file_id")
+    file_id: str | None = data.get("file_id")
     filename: str = data.get("filename", "audio.mp3")
+    bot_audio_msg_id: int | None = data.get("bot_audio_msg_id")
 
     if not file_id:
-        await callback.message.answer("❌ Файл не найден. Отправь аудио заново.")
+        await callback.answer("Файл не найден, отправь снова.", show_alert=True)
         await state.set_state(AudioState.waiting_for_file)
-        await callback.answer()
         return
 
     await state.set_state(AudioState.processing)
-    await callback.answer()
+    await callback.answer(f"⏳ {effect.emoji} {effect.label}...")
 
-    # Уведомление о начале обработки
-    status_msg = await callback.message.edit_text(
-        f"⏳ Обрабатываю: <b>{effect.label}</b>\n"
-        f"Файл: <code>{filename}</code>\n\n"
-        "Это займёт несколько секунд...",
-        reply_markup=None,
-    )
+    # Меняем кнопки на заглушку "обрабатываю"
+    if bot_audio_msg_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=callback.message.chat.id,
+                message_id=bot_audio_msg_id,
+                reply_markup=processing_keyboard(),
+            )
+        except TelegramBadRequest:
+            pass
 
     input_path = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}_{filename}"
     output_path: Path | None = None
 
     try:
-        # Скачиваем файл
-        logger.info(
-            "⬇️  Скачиваю: user=%d | file_id=%s",
-            callback.from_user.id, file_id,
-        )
+        # Скачиваем оригинал
         await _download_file(bot, file_id, input_path)
 
-        # Применяем эффект
+        # Обрабатываем
         output_path = await audio_processor.process(input_path, effect)
 
-        # Формируем имя выходного файла
+        # Имя выходного файла
         stem = Path(filename).stem
         out_filename = f"{stem}_{effect.callback_data}.mp3"
 
-        # Читаем и отправляем
+        # Отправляем результат С новыми кнопками
         audio_bytes = output_path.read_bytes()
-        await callback.message.answer_audio(
+        bot_me = await bot.get_me()
+        sent = await callback.message.answer_audio(
             audio=BufferedInputFile(audio_bytes, filename=out_filename),
-            caption=(
-                f"✅ Готово!\n"
-                f"🎛 Эффект: <b>{effect.label}</b>\n"
-                f"📁 Файл: <code>{out_filename}</code>"
-            ),
+            caption=f"{effect.emoji} {effect.label}  •  @{bot_me.username}",
+            reply_markup=effects_keyboard(),
         )
 
-        # Обновляем статус
-        await status_msg.edit_text(
-            "✅ Обработка завершена! Файл отправлен выше ⬆️\n\n"
-            "Отправь ещё аудио или выбери новый файл.",
+        # Теперь у нас новое аудио с кнопками
+        await state.update_data(
+            file_id=file_id,
+            filename=filename,
+            bot_audio_msg_id=sent.message_id,
         )
+
+        # Убираем кнопки со старого аудио
+        if bot_audio_msg_id:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=bot_audio_msg_id,
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                pass
 
         logger.info(
-            "📤 Отправлен: user=%d | effect=%s | size=%.1f KB",
+            "📤 Отправлен: user=%d | effect=%s | %.1f KB",
             callback.from_user.id, effect_key, len(audio_bytes) / 1024,
         )
 
     except TimeoutError as exc:
-        logger.warning("⏱️  Таймаут: user=%d | %s", callback.from_user.id, exc)
-        await status_msg.edit_text(
-            f"⏱️ <b>Превышено время обработки!</b>\n{exc}",
-            reply_markup=back_keyboard(),
-        )
+        logger.warning("Таймаут: user=%d", callback.from_user.id)
+        await callback.message.answer(f"⏱️ {exc}")
+        if bot_audio_msg_id:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=bot_audio_msg_id,
+                    reply_markup=effects_keyboard(),
+                )
+            except TelegramBadRequest:
+                pass
 
     except Exception as exc:
-        logger.exception("💥 Ошибка обработки: user=%d", callback.from_user.id)
-        await status_msg.edit_text(
-            f"💥 <b>Произошла ошибка:</b>\n<code>{exc}</code>\n\n"
-            "Попробуй другой файл.",
-            reply_markup=back_keyboard(),
-        )
+        logger.exception("Ошибка обработки: user=%d", callback.from_user.id)
+        await callback.message.answer(f"💥 Ошибка: {exc}\n\nПопробуй другой файл.")
+        if bot_audio_msg_id:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=bot_audio_msg_id,
+                    reply_markup=effects_keyboard(),
+                )
+            except TelegramBadRequest:
+                pass
 
     finally:
-        # Удаляем временные файлы
         audio_processor.cleanup(input_path)
         if output_path:
             audio_processor.cleanup(output_path)
-        # Возвращаем состояние
-        await state.set_state(AudioState.waiting_for_file)
-        await state.update_data(file_id=None, filename=None)
+        current = await state.get_state()
+        if current == AudioState.processing:
+            await state.set_state(AudioState.waiting_for_effect)
 
 
 # ──────────────────────────────────────────────
@@ -229,41 +268,4 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
 
 @router.callback_query(F.data == "noop")
 async def handle_noop(callback: CallbackQuery) -> None:
-    await callback.answer()
-
-
-@router.callback_query(F.data == "cancel")
-async def handle_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(AudioState.waiting_for_file)
-    try:
-        await callback.message.edit_text("❌ Отменено. Отправь новый аудиофайл.")
-    except TelegramBadRequest:
-        pass
-    await callback.answer("Отменено")
-
-
-@router.callback_query(F.data == "back_to_menu")
-async def handle_back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    file_id = data.get("file_id")
-
-    if file_id:
-        await state.set_state(AudioState.waiting_for_effect)
-        try:
-            await callback.message.edit_text(
-                "📂 Файл всё ещё у меня. Выбери эффект 👇",
-                reply_markup=main_menu_keyboard(),
-            )
-        except TelegramBadRequest:
-            pass
-    else:
-        await state.set_state(AudioState.waiting_for_file)
-        try:
-            await callback.message.edit_text(
-                "📂 Отправь аудиофайл, чтобы начать."
-            )
-        except TelegramBadRequest:
-            pass
-
     await callback.answer()

@@ -1,13 +1,12 @@
 """
 Сервис обработки аудио через ffmpeg.
 
-Поддерживаемые операции:
-  - speed_up / slowed  — изменение скорости с сохранением тональности (atempo)
-  - pitch_up / pitch_down — изменение тональности без изменения темпа
+Режим: виниловый эффект — скорость и тональность меняются вместе.
+Используется asetrate (изменяет sample rate → меняет и темп и pitch одновременно),
+затем aresample для нормализации обратно в 44100 Hz.
 """
 import asyncio
 import logging
-import os
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -17,69 +16,39 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+BASE_RATE = 44100  # стандартная частота дискретизации
+
 
 @dataclass
 class AudioEffect:
-    label: str          # отображаемое имя
-    callback_data: str  # ключ для callback
-    speed: float | None = None   # коэффициент скорости (atempo)
-    pitch_steps: int | None = None  # шаги в полутонах (+ вверх, - вниз)
+    label: str           # отображаемое имя
+    callback_data: str   # ключ для callback
+    speed: float         # множитель скорости (и тональности)
+    emoji: str = "🎵"
 
 
-# Реестр всех эффектов
+# Реестр эффектов — только скорость (pitch идёт автоматически)
 EFFECTS: dict[str, AudioEffect] = {
-    "speed_125":   AudioEffect("🚀 Speed Up ×1.25",  "speed_125",  speed=1.25),
-    "speed_150":   AudioEffect("🚀 Speed Up ×1.5",   "speed_150",  speed=1.50),
-    "speed_200":   AudioEffect("🚀 Speed Up ×2.0",   "speed_200",  speed=2.00),
-    "slow_075":    AudioEffect("🐌 Slowed ×0.75",    "slow_075",   speed=0.75),
-    "slow_050":    AudioEffect("🐌 Slowed ×0.5",     "slow_050",   speed=0.50),
-    "pitch_up2":   AudioEffect("🎵 Pitch +2",        "pitch_up2",  pitch_steps=2),
-    "pitch_up4":   AudioEffect("🎵 Pitch +4",        "pitch_up4",  pitch_steps=4),
-    "pitch_down2": AudioEffect("🎵 Pitch -2",        "pitch_down2", pitch_steps=-2),
-    "pitch_down4": AudioEffect("🎵 Pitch -4",        "pitch_down4", pitch_steps=-4),
+    "speed_125": AudioEffect("Speed Up ×1.25",  "speed_125", speed=1.25, emoji="✨"),
+    "speed_150": AudioEffect("Speed Up ×1.5",   "speed_150", speed=1.50, emoji="✨"),
+    "speed_200": AudioEffect("Speed Up ×2.0",   "speed_200", speed=2.00, emoji="✨"),
+    "slow_090":  AudioEffect("Slowed ×0.9",     "slow_090",  speed=0.90, emoji="🖥️"),
+    "slow_075":  AudioEffect("Slowed ×0.75",    "slow_075",  speed=0.75, emoji="🖥️"),
+    "slow_050":  AudioEffect("Slowed ×0.5",     "slow_050",  speed=0.50, emoji="🖥️"),
 }
 
 SUPPORTED_FORMATS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"}
 
 
-def _build_atempo_chain(speed: float) -> str:
+def _build_vinyl_filter(speed: float) -> str:
     """
-    ffmpeg atempo допускает значения 0.5..2.0.
-    Для значений вне диапазона строим цепочку фильтров.
+    Виниловый эффект: asetrate меняет sample rate пропорционально скорости,
+    aresample возвращает выходной поток к стандартным 44100 Hz.
+    Результат: трек звучит быстрее/медленнее И выше/ниже по тональности —
+    точно как при изменении скорости пластинки или кассеты.
     """
-    filters = []
-    remaining = speed
-
-    if speed > 1.0:
-        while remaining > 2.0:
-            filters.append("atempo=2.0")
-            remaining /= 2.0
-        filters.append(f"atempo={remaining:.4f}")
-    else:
-        while remaining < 0.5:
-            filters.append("atempo=0.5")
-            remaining /= 0.5
-        filters.append(f"atempo={remaining:.4f}")
-
-    return ",".join(filters)
-
-
-def _build_pitch_filter(semitones: int) -> str:
-    """
-    Изменение тональности через rubberband (если доступен) или
-    через asetrate + atempo (compat fallback).
-
-    asetrate меняет sample rate → воспринимается как pitch shift,
-    затем atempo компенсирует скорость воспроизведения.
-    """
-    factor = 2 ** (semitones / 12)            # мультипликатор частоты
-    atempo_compensation = 1.0 / factor        # компенсация скорости
-
-    asetrate = f"asetrate=44100*{factor:.6f}"
-    aresample = "aresample=44100"
-    atempo = _build_atempo_chain(atempo_compensation)
-
-    return f"{asetrate},{aresample},{atempo}"
+    new_rate = int(BASE_RATE * speed)
+    return f"asetrate={new_rate},aresample={BASE_RATE}"
 
 
 class AudioProcessor:
@@ -99,28 +68,18 @@ class AudioProcessor:
     def _tmp_path(self, suffix: str = ".mp3") -> Path:
         return self.temp_dir / f"{uuid.uuid4().hex}{suffix}"
 
-    async def process(
-        self,
-        input_path: Path,
-        effect: AudioEffect,
-    ) -> Path:
-        """Применяет эффект и возвращает путь к результату."""
+    async def process(self, input_path: Path, effect: AudioEffect) -> Path:
+        """Применяет виниловый эффект и возвращает путь к результату."""
         output_path = self._tmp_path(".mp3")
-
-        if effect.speed is not None:
-            af = _build_atempo_chain(effect.speed)
-        elif effect.pitch_steps is not None:
-            af = _build_pitch_filter(effect.pitch_steps)
-        else:
-            raise ValueError(f"Эффект '{effect.label}' не содержит параметров")
+        af = _build_vinyl_filter(effect.speed)
 
         cmd = [
             "ffmpeg",
-            "-y",                          # перезапись без вопросов
+            "-y",
             "-i", str(input_path),
             "-filter:a", af,
             "-acodec", "libmp3lame",
-            "-q:a", "2",                   # качество VBR ~190kbps
+            "-q:a", "2",
             str(output_path),
         ]
 
@@ -130,20 +89,17 @@ class AudioProcessor:
         )
 
         try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=settings.PROCESSING_TIMEOUT,
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=settings.PROCESSING_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            logger.error("⏱️  Превышен таймаут обработки (%ds)", settings.PROCESSING_TIMEOUT)
+            logger.error("⏱️  Превышен таймаут (%ds)", settings.PROCESSING_TIMEOUT)
             output_path.unlink(missing_ok=True)
             raise TimeoutError(
                 f"Обработка превысила {settings.PROCESSING_TIMEOUT} секунд. "
@@ -152,16 +108,18 @@ class AudioProcessor:
 
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace")
-            logger.error("❌ ffmpeg вернул код %d:\n%s", proc.returncode, err_msg)
+            logger.error("❌ ffmpeg код %d:\n%s", proc.returncode, err_msg)
             output_path.unlink(missing_ok=True)
             raise RuntimeError(f"Ошибка ffmpeg (код {proc.returncode})")
 
-        logger.info("✅ Обработка завершена: %s (%.1f KB)", output_path.name, output_path.stat().st_size / 1024)
+        logger.info(
+            "✅ Готово: %s (%.1f KB)",
+            output_path.name, output_path.stat().st_size / 1024,
+        )
         return output_path
 
     @staticmethod
     def cleanup(*paths: Path) -> None:
-        """Удаляет временные файлы."""
         for p in paths:
             try:
                 p.unlink(missing_ok=True)

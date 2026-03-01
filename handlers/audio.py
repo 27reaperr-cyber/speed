@@ -1,8 +1,9 @@
 """
 Главный обработчик аудио:
-  - приём файлов
-  - inline-меню прямо на аудио-сообщении (как в slowreverbbot)
-  - обработка и отправка результата с новыми кнопками
+  - приём .mp3 / .m4a / .wav / .ogg / .flac / .aac — как audio и как document
+  - приём голосовых сообщений (voice)
+  - работает в ЛЮБОМ состоянии FSM (не требует /start)
+  - inline-меню прямо на аудио-сообщении
   - случайная реакция на сообщение пользователя
 """
 import logging
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Audio,
@@ -34,29 +36,48 @@ router = Router(name="audio")
 # Пул реакций для случайного выбора
 REACTION_POOL = ["❤️", "🔥", "🎉", "👏", "😍", "⚡", "🎵", "💯", "🤩", "😎"]
 
+# Состояния, в которых принимаем новые файлы
+ACCEPT_STATES = StateFilter(AudioState.waiting_for_file, AudioState.waiting_for_effect, None)
+
 
 # ──────────────────────────────────────────────
 #  Вспомогательные функции
 # ──────────────────────────────────────────────
 
 def _get_file_info(message: Message) -> tuple[str, int, str] | None:
+    """
+    Возвращает (file_id, file_size, filename) или None.
+    Обрабатывает: audio, voice, document с поддерживаемым расширением.
+    """
+    # Аудиофайл (Telegram определил как музыку)
     if message.audio:
         obj: Audio = message.audio
         name = obj.file_name or f"audio_{uuid.uuid4().hex[:8]}.mp3"
         return obj.file_id, obj.file_size or 0, name
 
+    # Голосовое сообщение (всегда .ogg opus)
     if message.voice:
         obj: Voice = message.voice
         return obj.file_id, obj.file_size or 0, f"voice_{uuid.uuid4().hex[:8]}.ogg"
 
+    # Документ — проверяем расширение
     if message.document:
         obj: Document = message.document
-        name = obj.file_name or "file"
+        name = obj.file_name or "file.mp3"
         ext = Path(name).suffix.lower()
         if ext in SUPPORTED_FORMATS:
             return obj.file_id, obj.file_size or 0, name
 
     return None
+
+
+def _is_unsupported_document(message: Message) -> bool:
+    """True только если это документ с неподдерживаемым расширением."""
+    if not message.document:
+        return False
+    name = message.document.file_name or ""
+    ext = Path(name).suffix.lower()
+    return ext not in SUPPORTED_FORMATS
 
 
 async def _download_file(bot: Bot, file_id: str, dest: Path) -> None:
@@ -78,21 +99,24 @@ async def _set_random_reaction(bot: Bot, chat_id: int, message_id: int) -> None:
 
 
 # ──────────────────────────────────────────────
-#  Приём аудио → отправка с inline-меню
+#  Приём аудио — работает в ЛЮБОМ состоянии
 # ──────────────────────────────────────────────
 
 @router.message(
-    AudioState.waiting_for_file,
+    ACCEPT_STATES,
     F.content_type.in_({"audio", "voice", "document"}),
 )
 async def handle_audio(message: Message, state: FSMContext, bot: Bot) -> None:
     info = _get_file_info(message)
 
+    # Документ с неподдерживаемым расширением
     if info is None:
-        await message.answer(
-            f"❌ Неподдерживаемый формат.\n"
-            f"Принимаю: {', '.join(sorted(SUPPORTED_FORMATS))}"
-        )
+        if message.document:
+            ext = Path(message.document.file_name or "").suffix.lower()
+            await message.answer(
+                f"❌ Формат <code>{ext or 'неизвестен'}</code> не поддерживается.\n\n"
+                f"Принимаю: {', '.join(sorted(SUPPORTED_FORMATS))}"
+            )
         return
 
     file_id, file_size, filename = info
@@ -105,7 +129,7 @@ async def handle_audio(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
 
-    # Сохраняем в FSM
+    # Обновляем состояние
     await state.update_data(
         file_id=file_id,
         filename=filename,
@@ -113,34 +137,20 @@ async def handle_audio(message: Message, state: FSMContext, bot: Bot) -> None:
     )
     await state.set_state(AudioState.waiting_for_effect)
 
-    # Ставим случайную реакцию на исходное сообщение пользователя
+    # Случайная реакция на сообщение пользователя
     await _set_random_reaction(bot, message.chat.id, message.message_id)
 
-    # Пересылаем аудио обратно с inline-кнопками прямо на нём
+    # Копируем аудио обратно с inline-кнопками прямо на нём
     sent = await message.copy_to(
         chat_id=message.chat.id,
         reply_markup=effects_keyboard(),
     )
 
-    # Сохраняем message_id нашего аудио-сообщения с кнопками
     await state.update_data(bot_audio_msg_id=sent.message_id)
 
     logger.info(
-        "📥 Файл получен: user=%d | name=%s | size=%d B",
-        message.from_user.id, filename, file_size,
-    )
-
-
-# ──────────────────────────────────────────────
-#  Неверный документ
-# ──────────────────────────────────────────────
-
-@router.message(AudioState.waiting_for_file, F.document)
-async def handle_wrong_document(message: Message) -> None:
-    ext = Path(message.document.file_name or "").suffix.lower()
-    await message.answer(
-        f"❌ Формат {ext or 'неизвестен'} не поддерживается.\n"
-        f"Поддерживаю: {', '.join(sorted(SUPPORTED_FORMATS))}"
+        "📥 Файл получен: user=%d | name=%s | size=%d B | type=%s",
+        message.from_user.id, filename, file_size, message.content_type,
     )
 
 
@@ -170,7 +180,7 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
     await state.set_state(AudioState.processing)
     await callback.answer(f"⏳ {effect.emoji} {effect.label}...")
 
-    # Меняем кнопки на заглушку "обрабатываю"
+    # Кнопки → заглушка "обрабатываю"
     if bot_audio_msg_id:
         try:
             await bot.edit_message_reply_markup(
@@ -181,7 +191,9 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
         except TelegramBadRequest:
             pass
 
-    input_path = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}_{filename}"
+    # Определяем расширение для сохранения: голосовые → .ogg, остальные как есть
+    src_ext = Path(filename).suffix.lower() or ".mp3"
+    input_path = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}{src_ext}"
     output_path: Path | None = None
 
     try:
@@ -195,7 +207,7 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
         stem = Path(filename).stem
         out_filename = f"{stem}_{effect.callback_data}.mp3"
 
-        # Отправляем результат С новыми кнопками
+        # Отправляем результат с кнопками
         audio_bytes = output_path.read_bytes()
         bot_me = await bot.get_me()
         sent = await callback.message.answer_audio(
@@ -204,7 +216,7 @@ async def handle_effect_choice(callback: CallbackQuery, state: FSMContext, bot: 
             reply_markup=effects_keyboard(),
         )
 
-        # Теперь у нас новое аудио с кнопками
+        # Обновляем msg_id — теперь кнопки на новом аудио
         await state.update_data(
             file_id=file_id,
             filename=filename,

@@ -73,13 +73,18 @@ class AudioProcessor:
         output_path = self._tmp_path(".mp3")
         af = _build_vinyl_filter(effect.speed)
 
+        # -vn убирает видео/обложку (иначе ошибка на .m4a с картинкой)
+        # -ar / -ac нормализуют выход в стерео 44100 Hz
         cmd = [
             "ffmpeg",
             "-y",
             "-i", str(input_path),
+            "-vn",
             "-filter:a", af,
             "-acodec", "libmp3lame",
             "-q:a", "2",
+            "-ar", "44100",
+            "-ac", "2",
             str(output_path),
         ]
 

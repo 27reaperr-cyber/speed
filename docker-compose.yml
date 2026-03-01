@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  speedbot:
+    build: .
+    container_name: speed_slowed_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./temp:/app/temp
+      - ./bot.log:/app/bot.log

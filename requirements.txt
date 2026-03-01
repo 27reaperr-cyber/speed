@@ -1,0 +1,4 @@
+aiogram==3.13.1
+pydantic-settings==2.6.1
+pydantic==2.10.3
+aiofiles==24.1.0
